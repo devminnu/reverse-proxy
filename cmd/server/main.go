@@ -1,26 +1,44 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
-
-	"reverse-proxy/config"
-	"reverse-proxy/pkg/proxy"
+	"time"
 
 	"github.com/quic-go/quic-go/http3"
 )
 
 func main() {
+	// Add HTTP server for the ping API
+	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("Ping request received")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("pong"))
+	})
+
+	// Start the HTTP server for ping API
+	go func() {
+		fmt.Println("Starting HTTP server on :8080 for /ping")
+		if err := http.ListenAndServe(":8080", httpMux); err != nil {
+			log.Fatalf("Failed to start HTTP server: %v", err)
+		}
+	}()
+
 	// Load configuration
-	cfg := config.LoadConfig()
+	cfg := LoadConfig()
 	mux := http.NewServeMux()
-	mux.Handle("/bridge/tonkeeper", proxy.ProxyHandler(cfg))
+	mux.Handle("/bridge/tonkeeper", ProxyHandler(cfg))
 
 	// Create the HTTP/3 server
 	http3Server := &http3.Server{
@@ -89,4 +107,94 @@ func loadTLSConfig(certFile, keyFile string) *tls.Config {
 	tlsConfig.Certificates[0] = cert
 
 	return tlsConfig
+}
+
+func ProxyHandler(cfg *Config) http.Handler {
+	targetURL, err := url.Parse(cfg.BackendURL)
+	if err != nil {
+		log.Println("invalid/unsupported backend url")
+		panic(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	proxy.Director = func(req *http.Request) {
+		req.URL.Scheme = targetURL.Scheme
+		req.URL.Host = targetURL.Host
+		req.URL.Path = targetURL.Path
+
+		query := req.URL.Query()
+		if clientID := query.Get("pub"); clientID != "" {
+			query.Set("client_id", clientID)
+			query.Del("pub")
+		}
+		req.URL.RawQuery = query.Encode()
+
+		req.Header.Del("Origin")
+		req.Header.Del("Referer")
+	}
+
+	proxy.ModifyResponse = func(res *http.Response) error {
+		res.Header.Del("Origin")
+		res.Header.Del("Referer")
+		return nil
+	}
+
+	// Timeout wrapper
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Println("request received")
+		ctx, cancel := context.WithTimeout(r.Context(), cfg.RequestTimeout)
+		defer cancel()
+
+		// Use a context-aware request
+		r = r.WithContext(ctx)
+
+		// Start the proxy
+		proxy.ServeHTTP(w, r)
+
+		select {
+		case <-ctx.Done():
+			// If the timeout occurs, close the response
+			log.Println("Request timed out")
+			w.WriteHeader(http.StatusGatewayTimeout)
+		default:
+			// Continue serving the request until timeout happens
+		}
+	})
+}
+
+type Config struct {
+	BackendURL     string
+	RequestTimeout time.Duration
+	CertFile       string
+	KeyFile        string
+}
+
+func LoadConfig() *Config {
+	backendURL := getEnv("BACKEND_URL", "https://bridge.tonapi.io/bridge/events")
+	requestTimeout := getEnvAsInt("REQUEST_TIMEOUT", 60) // Default timeout of 60 seconds
+	certFile := getEnv("TLS_CERT_FILE", "cert.pem")
+	keyFile := getEnv("TLS_KEY_FILE", "key.pem")
+
+	return &Config{
+		BackendURL:     backendURL,
+		RequestTimeout: time.Duration(requestTimeout) * time.Second,
+		CertFile:       certFile,
+		KeyFile:        keyFile,
+	}
+}
+
+// Helper functions to get environment variables
+func getEnv(key, defaultValue string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvAsInt(name string, defaultValue int) int {
+	if valueStr, exists := os.LookupEnv(name); exists {
+		if value, err := strconv.Atoi(valueStr); err == nil {
+			return value
+		}
+	}
+	return defaultValue
 }
