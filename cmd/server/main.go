@@ -19,25 +19,45 @@ import (
 )
 
 func main() {
-	// Add HTTP server for the ping API
+	cfg := LoadConfig()
 	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("HTTP2 / request received")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Hello HTTP2\n"))
+	})
 	httpMux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
 		log.Println("Ping request received")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("pong"))
+		w.Write([]byte("pong\n"))
 	})
 
-	// Start the HTTP server for ping API
+	// Create HTTP/2 server
+	http2Server := &http.Server{
+		Addr:    ":9443",
+		Handler: httpMux,
+		TLSConfig: &tls.Config{
+			NextProtos:         []string{"h2", "http/1.1"}, // Negotiate both HTTP/1.1 and HTTP/2
+			InsecureSkipVerify: false,
+		},
+	}
+
+	// Start HTTP/2 server
 	go func() {
-		fmt.Println("Starting HTTP server on :8080 for /ping")
-		if err := http.ListenAndServe(":8080", httpMux); err != nil {
-			log.Fatalf("Failed to start HTTP server: %v", err)
+		fmt.Println("Starting HTTP/2 server on :9443")
+		err := http2Server.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile)
+		if err != nil {
+			log.Fatalf("HTTP/2 server failed: %v\n", err)
 		}
 	}()
 
 	// Load configuration
-	cfg := LoadConfig()
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("HTTP3 / request received")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Hello HTTP3\n"))
+	})
 	mux.Handle("/bridge/tonkeeper", ProxyHandler(cfg))
 
 	// Create the HTTP/3 server
@@ -92,19 +112,20 @@ func main() {
 }
 
 func loadTLSConfig(certFile, keyFile string) *tls.Config {
-	// Create TLS configuration for HTTP/3
-	tlsConfig := &tls.Config{
-		MinVersion:         tls.VersionTLS13, // HTTP/3 requires at least TLS 1.3
-		Certificates:       make([]tls.Certificate, 1),
-		NextProtos:         []string{"h3"}, // Support HTTP/3 only
-		InsecureSkipVerify: true,
-	}
 	// Load TLS certificates
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		log.Fatalf("failed to load TLS certificates: %v", err)
+
+		return nil
 	}
-	tlsConfig.Certificates[0] = cert
+	// Create TLS configuration for HTTP/3
+	tlsConfig := &tls.Config{
+		MinVersion:         tls.VersionTLS13, // HTTP/3 requires at least TLS 1.3
+		Certificates:       []tls.Certificate{cert},
+		NextProtos:         []string{"h3"}, // Support HTTP/3 only
+		InsecureSkipVerify: false,
+	}
 
 	return tlsConfig
 }
