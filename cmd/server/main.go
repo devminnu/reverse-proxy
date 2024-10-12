@@ -76,9 +76,10 @@ func main() {
 func loadTLSConfig(certFile, keyFile string) *tls.Config {
 	// Create TLS configuration for HTTP/3
 	tlsConfig := &tls.Config{
-		MinVersion:   tls.VersionTLS13, // HTTP/3 requires at least TLS 1.3
-		Certificates: make([]tls.Certificate, 1),
-		NextProtos:   []string{"h3"}, // Support HTTP/3 only
+		MinVersion:         tls.VersionTLS13, // HTTP/3 requires at least TLS 1.3
+		Certificates:       make([]tls.Certificate, 1),
+		NextProtos:         []string{"h3"}, // Support HTTP/3 only
+		InsecureSkipVerify: true,
 	}
 	// Load TLS certificates
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
