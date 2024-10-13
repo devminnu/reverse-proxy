@@ -31,6 +31,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("pong\n"))
 	})
+	httpMux.Handle("/bridge/tonkeeper", ProxyHandler(cfg))
 
 	// Create HTTP/2 server
 	http2Server := &http.Server{
