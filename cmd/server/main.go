@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 func main() {
@@ -24,15 +26,18 @@ func main() {
 	// Handle /bridge/tonkeeper proxying with SSE stream forwarding
 	httpMux.Handle("/bridge/tonkeeper", ProxyHandlerWithTimeout(cfg))
 
-	// HTTP/2 server with 20-second timeout
+	// Create HTTP/2 server
 	http2Server := &http.Server{
 		Addr:    ":9443",
 		Handler: httpMux,
 		TLSConfig: &tls.Config{
-			NextProtos:         []string{"h2", "http/1.1"},
-			InsecureSkipVerify: true, // Bypass TLS verification for local testing
+			NextProtos:         []string{"h2", "http/1.1"}, // Support HTTP/2 and HTTP/1.1
+			InsecureSkipVerify: true,                       // Bypass TLS verification for local testing
 		},
 	}
+
+	// Enable HTTP/2 on the server
+	http2.ConfigureServer(http2Server, &http2.Server{})
 
 	// Signal handling for graceful shutdown
 	stop := make(chan os.Signal, 1)
@@ -114,7 +119,7 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 		return nil
 	}
 
-	// Handle any errors during the proxying
+	// Handle the timeout error gracefully
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		if err == context.DeadlineExceeded {
 			log.Println("Context deadline exceeded, closing backend response")
@@ -148,19 +153,23 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 
 		select {
 		case <-ctx.Done():
-			// When the context times out, ensure the connection is closed gracefully
+			// When the context times out, close the backend connection first
 			if ctx.Err() == context.DeadlineExceeded {
-				log.Println("Timeout reached, closing connection with backend and sending 200 OK to client")
+				log.Println("Timeout reached, closing connection with backend")
 
-				// Send the headers and flush before closing
+				// Flush the remaining data to the client
+				flusher.Flush()
+
+				// Send final response to client and gracefully close
+				log.Println("Sending final response and closing client connection gracefully")
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
 
-				// Send a final message to indicate closure
+				// Send final message to indicate connection closure
 				w.Write([]byte("Connection closed successfully after 20 seconds\n"))
-				flusher.Flush() // Ensure the client receives all data
+				flusher.Flush() // Ensure client receives the final data
 
-				// Wait briefly to allow the browser to acknowledge the close
+				// Wait briefly to ensure graceful termination
 				time.Sleep(100 * time.Millisecond)
 				return
 			}
