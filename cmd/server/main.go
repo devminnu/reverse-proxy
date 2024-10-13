@@ -140,11 +140,15 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 			// When the context times out, ensure the connection is closed gracefully
 			if ctx.Err() == context.DeadlineExceeded {
 				log.Println("Timeout reached, closing connection with backend and sending 200 OK to client")
-				// Send 200 OK and flush any remaining data
+				// Final flush to ensure all data is sent to the client
+				flusher.Flush()
+
+				// Close the connection with a proper 200 OK
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
 				w.Write([]byte("Connection closed successfully after 20 seconds\n"))
-				flusher.Flush() // Ensure the client receives all data
+				flusher.Flush() // Final flush to ensure the client gets the final message
+
 				return
 			}
 		}
