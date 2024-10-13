@@ -119,8 +119,8 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 	proxy.Transport = &customRoundTripper{
 		rt: &http.Transport{
 			DialContext: (&net.Dialer{
-				Timeout:   20 * time.Second,
-				KeepAlive: 20 * time.Second,
+				Timeout:   60 * time.Second,
+				KeepAlive: 60 * time.Second,
 			}).DialContext,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
@@ -157,7 +157,7 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Use a context with timeout
-		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 
 		// Handle flushing the data stream to the client
@@ -275,7 +275,7 @@ type Config struct {
 // LoadConfig from environment variables
 func LoadConfig() *Config {
 	backendURL := getEnv("BACKEND_URL", "https://bridge.tonapi.io/bridge/events")
-	requestTimeout := getEnvAsInt("REQUEST_TIMEOUT", 20) // Default timeout of 20 seconds
+	requestTimeout := getEnvAsInt("REQUEST_TIMEOUT", 60) // Default timeout of 60 seconds
 	certFile := getEnv("TLS_CERT_FILE", "cert.pem")
 	keyFile := getEnv("TLS_KEY_FILE", "key.pem")
 

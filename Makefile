@@ -11,7 +11,7 @@ REQUEST_TIMEOUT=60
 
 # Go commands
 GO=go
-RUN=$(GO) run cmd/server/main.go
+RUN=$(GO) run cmd/server/*.go
 
 # Default target
 all: run
