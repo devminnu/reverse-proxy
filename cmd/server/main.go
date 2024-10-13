@@ -20,7 +20,10 @@ import (
 
 func main() {
 	cfg := LoadConfig()
+
 	httpMux := http.NewServeMux()
+
+	// HTTP2 and ping endpoints
 	httpMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Println("HTTP2 / request received")
 		w.WriteHeader(http.StatusOK)
@@ -31,12 +34,14 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("pong\n"))
 	})
+
+	// Handle /bridge/tonkeeper proxying
 	httpMux.Handle("/bridge/tonkeeper", ProxyHandler(cfg))
 
-	// Create HTTP/2 server
+	// HTTP/2 server with 30-second timeout
 	http2Server := &http.Server{
 		Addr:    ":9443",
-		Handler: httpMux,
+		Handler: TimeoutHandler(httpMux, 30*time.Second),
 		TLSConfig: &tls.Config{
 			NextProtos:         []string{"h2", "http/1.1"}, // Negotiate both HTTP/1.1 and HTTP/2
 			InsecureSkipVerify: false,
@@ -52,7 +57,7 @@ func main() {
 		}
 	}()
 
-	// Load configuration
+	// Load HTTP/3 configuration
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Println("HTTP3 / request received")
@@ -61,25 +66,24 @@ func main() {
 	})
 	mux.Handle("/bridge/tonkeeper", ProxyHandler(cfg))
 
-	// Create the HTTP/3 server
+	// Create HTTP/3 server with 30-second timeout
 	http3Server := &http3.Server{
 		TLSConfig: loadTLSConfig(cfg.CertFile, cfg.KeyFile),
-		Handler:   mux,
+		Handler:   TimeoutHandler(mux, 30*time.Second),
 	}
 
-	// Channel to signal server shutdown
+	// Signal handling for graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	// Channel to ensure server is properly stopped
 	done := make(chan bool, 1)
 
-	// UDP listener for HTTP/3
+	// Start HTTP/3 listener
 	udpListener, err := net.ListenPacket("udp", ":443")
 	if err != nil {
 		log.Fatalf("Failed to start UDP listener for HTTP/3: %v", err)
 	}
 
-	// Start the HTTP/3 server in a separate goroutine
+	// Start HTTP/3 server in a separate goroutine
 	go func() {
 		fmt.Println("Starting HTTP/3 server on :443")
 		log.Println("HTTP/3 server listening on UDP port 443")
@@ -88,56 +92,75 @@ func main() {
 			log.Fatalf("HTTP/3 server failed: %v", err)
 		}
 	}()
-	// Block until we receive the shutdown signal
+
+	// Block until shutdown signal
 	<-stop
 
-	// Shutdown process begins
+	// Shutdown process
 	log.Println("Shutting down server...")
 	go func() {
-		// Close the UDP listener to stop accepting new connections
-		log.Println("closing the UDP listener...")
 		if err := udpListener.Close(); err != nil {
 			log.Println(err)
 		}
-		log.Println("closed udp listener")
-		log.Println("shutting down server")
 		if err := http3Server.Close(); err != nil {
 			log.Println(err)
 		}
-		// Inform that the server is shutting down
-		log.Println("server has been shut down")
 		done <- true
 	}()
-	// Wait for the shutdown process to complete
 	<-done
 }
 
 func loadTLSConfig(certFile, keyFile string) *tls.Config {
-	// Load TLS certificates
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		log.Fatalf("failed to load TLS certificates: %v", err)
-
-		return nil
 	}
-	// Create TLS configuration for HTTP/3
-	tlsConfig := &tls.Config{
+	return &tls.Config{
 		MinVersion:         tls.VersionTLS13, // HTTP/3 requires at least TLS 1.3
 		Certificates:       []tls.Certificate{cert},
 		NextProtos:         []string{"h3"}, // Support HTTP/3 only
 		InsecureSkipVerify: false,
 	}
-
-	return tlsConfig
 }
 
+// TimeoutHandler to enforce a 30-second timeout for connections
+func TimeoutHandler(next http.Handler, timeout time.Duration) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+
+		done := make(chan struct{})
+
+		// Serve request in a separate goroutine
+		go func() {
+			next.ServeHTTP(w, r.WithContext(ctx))
+			close(done)
+		}()
+
+		select {
+		case <-ctx.Done():
+			// Handle timeout
+			if ctx.Err() == context.DeadlineExceeded {
+				log.Println("Timeout reached, returning 200 OK and closing connection")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("Connection closed after 30 seconds\n"))
+			}
+		case <-done:
+			// Request completed before the timeout
+		}
+	})
+}
+
+// ProxyHandler to handle forwarding requests to the backend and streaming SSE
 func ProxyHandler(cfg *Config) http.Handler {
 	targetURL, err := url.Parse(cfg.BackendURL)
 	if err != nil {
-		log.Println("invalid/unsupported backend url")
+		log.Println("Invalid/unsupported backend URL")
 		panic(err)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+
+	// Modify the request before forwarding to the backend
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = targetURL.Scheme
 		req.URL.Host = targetURL.Host
@@ -154,35 +177,51 @@ func ProxyHandler(cfg *Config) http.Handler {
 		req.Header.Del("Referer")
 	}
 
-	proxy.ModifyResponse = func(res *http.Response) error {
-		res.Header.Del("Origin")
-		res.Header.Del("Referer")
-		return nil
+	// Custom error handler for ReverseProxy to handle errors gracefully
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		if err == context.DeadlineExceeded {
+			log.Println("Proxy error: context deadline exceeded, returning 504 Gateway Timeout")
+			http.Error(w, "Request timed out", http.StatusGatewayTimeout)
+		} else {
+			log.Printf("Proxy error: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+		}
 	}
 
-	// Timeout wrapper
+	// Custom transport that stops reading from the backend when context is canceled
+	proxy.Transport = &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	// Handle backend SSE and ensure connection closure after 30 seconds
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Println("request received")
-		ctx, cancel := context.WithTimeout(r.Context(), cfg.RequestTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 
-		// Use a context-aware request
+		// Use context with timeout for the request
 		r = r.WithContext(ctx)
 
-		// Start the proxy
+		// Serve the proxy request
 		proxy.ServeHTTP(w, r)
 
+		// Handle context deadline exceeded or successful request completion
 		select {
 		case <-ctx.Done():
-			// If the timeout occurs, close the response
-			log.Println("Request timed out")
-			w.WriteHeader(http.StatusGatewayTimeout)
-		default:
-			// Continue serving the request until timeout happens
+			if ctx.Err() == context.DeadlineExceeded {
+				log.Println("Timeout: Closing both client and backend connections")
+				return
+			}
 		}
 	})
 }
 
+// Config struct to store configuration variables
 type Config struct {
 	BackendURL     string
 	RequestTimeout time.Duration
@@ -190,9 +229,10 @@ type Config struct {
 	KeyFile        string
 }
 
+// LoadConfig from environment variables
 func LoadConfig() *Config {
 	backendURL := getEnv("BACKEND_URL", "https://bridge.tonapi.io/bridge/events")
-	requestTimeout := getEnvAsInt("REQUEST_TIMEOUT", 60) // Default timeout of 60 seconds
+	requestTimeout := getEnvAsInt("REQUEST_TIMEOUT", 30) // Default timeout of 30 seconds
 	certFile := getEnv("TLS_CERT_FILE", "cert.pem")
 	keyFile := getEnv("TLS_KEY_FILE", "key.pem")
 
