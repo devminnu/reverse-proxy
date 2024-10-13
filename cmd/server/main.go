@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -14,62 +15,23 @@ import (
 	"strconv"
 	"syscall"
 	"time"
-
-	"github.com/quic-go/quic-go/http3"
 )
 
 func main() {
 	cfg := LoadConfig()
-
 	httpMux := http.NewServeMux()
 
-	// HTTP2 and ping endpoints
-	httpMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("HTTP2 / request received")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Hello HTTP2\n"))
-	})
-	httpMux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("Ping request received")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("pong\n"))
-	})
+	// Handle /bridge/tonkeeper proxying with SSE stream forwarding
+	httpMux.Handle("/bridge/tonkeeper", ProxyHandlerWithTimeout(cfg))
 
-	// Handle /bridge/tonkeeper proxying
-	httpMux.Handle("/bridge/tonkeeper", ProxyHandler(cfg))
-
-	// HTTP/2 server with 30-second timeout
+	// HTTP/2 server with 20-second timeout
 	http2Server := &http.Server{
 		Addr:    ":9443",
-		Handler: TimeoutHandler(httpMux, 30*time.Second),
+		Handler: httpMux,
 		TLSConfig: &tls.Config{
-			NextProtos:         []string{"h2", "http/1.1"}, // Negotiate both HTTP/1.1 and HTTP/2
-			InsecureSkipVerify: false,
+			NextProtos:         []string{"h2", "http/1.1"},
+			InsecureSkipVerify: true, // Bypass TLS verification for local testing
 		},
-	}
-
-	// Start HTTP/2 server
-	go func() {
-		fmt.Println("Starting HTTP/2 server on :9443")
-		err := http2Server.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile)
-		if err != nil {
-			log.Fatalf("HTTP/2 server failed: %v\n", err)
-		}
-	}()
-
-	// Load HTTP/3 configuration
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("HTTP3 / request received")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Hello HTTP3\n"))
-	})
-	mux.Handle("/bridge/tonkeeper", ProxyHandler(cfg))
-
-	// Create HTTP/3 server with 30-second timeout
-	http3Server := &http3.Server{
-		TLSConfig: loadTLSConfig(cfg.CertFile, cfg.KeyFile),
-		Handler:   TimeoutHandler(mux, 30*time.Second),
 	}
 
 	// Signal handling for graceful shutdown
@@ -77,19 +39,12 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	done := make(chan bool, 1)
 
-	// Start HTTP/3 listener
-	udpListener, err := net.ListenPacket("udp", ":443")
-	if err != nil {
-		log.Fatalf("Failed to start UDP listener for HTTP/3: %v", err)
-	}
-
-	// Start HTTP/3 server in a separate goroutine
+	// Start HTTP/2 server
 	go func() {
-		fmt.Println("Starting HTTP/3 server on :443")
-		log.Println("HTTP/3 server listening on UDP port 443")
-		err = http3Server.Serve(udpListener)
+		fmt.Println("Starting HTTP/2 server on :9443")
+		err := http2Server.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile)
 		if err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP/3 server failed: %v", err)
+			log.Fatalf("HTTP/2 server failed: %v\n", err)
 		}
 	}()
 
@@ -98,67 +53,42 @@ func main() {
 
 	// Shutdown process
 	log.Println("Shutting down server...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	go func() {
-		if err := udpListener.Close(); err != nil {
-			log.Println(err)
-		}
-		if err := http3Server.Close(); err != nil {
-			log.Println(err)
+		// Gracefully shutdown the HTTP/2 server
+		if err := http2Server.Shutdown(shutdownCtx); err != nil {
+			log.Println("Error while shutting down HTTP/2 server:", err)
 		}
 		done <- true
 	}()
+
 	<-done
+	log.Println("Server gracefully stopped")
 }
 
-func loadTLSConfig(certFile, keyFile string) *tls.Config {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		log.Fatalf("failed to load TLS certificates: %v", err)
-	}
-	return &tls.Config{
-		MinVersion:         tls.VersionTLS13, // HTTP/3 requires at least TLS 1.3
-		Certificates:       []tls.Certificate{cert},
-		NextProtos:         []string{"h3"}, // Support HTTP/3 only
-		InsecureSkipVerify: false,
-	}
-}
-
-// TimeoutHandler to enforce a 30-second timeout for connections
-func TimeoutHandler(next http.Handler, timeout time.Duration) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
-		defer cancel()
-
-		done := make(chan struct{})
-
-		// Serve request in a separate goroutine
-		go func() {
-			next.ServeHTTP(w, r.WithContext(ctx))
-			close(done)
-		}()
-
-		select {
-		case <-ctx.Done():
-			// Handle timeout
-			if ctx.Err() == context.DeadlineExceeded {
-				log.Println("Timeout reached, returning 200 OK and closing connection")
-				w.WriteHeader(http.StatusOK)
-				w.Write([]byte("Connection closed after 30 seconds\n"))
-			}
-		case <-done:
-			// Request completed before the timeout
-		}
-	})
-}
-
-// ProxyHandler to handle forwarding requests to the backend and streaming SSE
-func ProxyHandler(cfg *Config) http.Handler {
+// ProxyHandlerWithTimeout proxies the incoming request to the backend and stops after a timeout
+func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 	targetURL, err := url.Parse(cfg.BackendURL)
 	if err != nil {
 		log.Println("Invalid/unsupported backend URL")
 		panic(err)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+
+	// Use a custom RoundTripper to handle timeouts and real-time streaming of SSE events
+	proxy.Transport = &customRoundTripper{
+		rt: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   20 * time.Second,
+				KeepAlive: 20 * time.Second,
+			}).DialContext,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
 
 	// Modify the request before forwarding to the backend
 	proxy.Director = func(req *http.Request) {
@@ -177,48 +107,123 @@ func ProxyHandler(cfg *Config) http.Handler {
 		req.Header.Del("Referer")
 	}
 
-	// Custom error handler for ReverseProxy to handle errors gracefully
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		if err == context.DeadlineExceeded {
-			log.Println("Proxy error: context deadline exceeded, returning 504 Gateway Timeout")
-			http.Error(w, "Request timed out", http.StatusGatewayTimeout)
-		} else {
-			log.Printf("Proxy error: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-		}
+	// Ensure real-time data forwarding from backend to client
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		// Ensure that Transfer-Encoding is set to chunked to support real-time streaming
+		resp.TransferEncoding = []string{"chunked"}
+		return nil
 	}
 
-	// Custom transport that stops reading from the backend when context is canceled
-	proxy.Transport = &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-
-	// Handle backend SSE and ensure connection closure after 30 seconds
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		// Set the context with a 20-second timeout
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
+
+		// Create a custom ResponseWriter to stream the data in real-time
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		// Wrap the response writer to handle context cancellation and streaming
+		cw := &contextAwareResponseWriter{w: w, ctx: ctx, flusher: flusher}
 
 		// Use context with timeout for the request
 		r = r.WithContext(ctx)
 
-		// Serve the proxy request
-		proxy.ServeHTTP(w, r)
+		// Serve the proxy request, allowing the client to receive the SSE events in real-time
+		proxy.ServeHTTP(cw, r)
 
-		// Handle context deadline exceeded or successful request completion
 		select {
 		case <-ctx.Done():
+			// When the context times out, ensure the connection is closed gracefully
 			if ctx.Err() == context.DeadlineExceeded {
-				log.Println("Timeout: Closing both client and backend connections")
+				log.Println("Timeout reached, closing connection with backend and sending 200 OK to client")
+				// Send 200 OK and flush any remaining data
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("Connection closed successfully after 20 seconds\n"))
+				flusher.Flush() // Ensure the client receives all data
 				return
 			}
 		}
 	})
+}
+
+// Custom RoundTripper that stops the backend stream after the timeout
+type customRoundTripper struct {
+	rt http.RoundTripper
+}
+
+func (c *customRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+
+	// Make the actual backend request
+	resp, err := c.rt.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Start a goroutine to monitor the context and close the connection when the context is canceled
+	go func() {
+		select {
+		case <-ctx.Done():
+			log.Println("Context canceled, closing backend response body")
+			resp.Body.Close() // Gracefully close the response body when the context is canceled
+		}
+	}()
+
+	// Wrap the response body with a reader that respects context cancellation
+	resp.Body = &contextAwareReadCloser{ctx: ctx, ReadCloser: resp.Body}
+	return resp, nil
+}
+
+// Custom context-aware ReadCloser to close the response body on context cancellation
+type contextAwareReadCloser struct {
+	ctx context.Context
+	io.ReadCloser
+}
+
+func (c *contextAwareReadCloser) Read(p []byte) (n int, err error) {
+	select {
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err() // Stop reading when the context is canceled
+	default:
+		return c.ReadCloser.Read(p)
+	}
+}
+
+// Custom response writer that respects context cancellation and supports streaming
+type contextAwareResponseWriter struct {
+	w       http.ResponseWriter
+	ctx     context.Context
+	flusher http.Flusher
+}
+
+func (c *contextAwareResponseWriter) Header() http.Header {
+	return c.w.Header()
+}
+
+func (c *contextAwareResponseWriter) Write(data []byte) (int, error) {
+	select {
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err()
+	default:
+		n, err := c.w.Write(data)
+		c.flusher.Flush() // Ensure data is flushed to the client immediately
+		return n, err
+	}
+}
+
+func (c *contextAwareResponseWriter) WriteHeader(statusCode int) {
+	select {
+	case <-c.ctx.Done():
+		// Don't write headers if the context is already canceled
+	default:
+		c.w.WriteHeader(statusCode)
+		c.flusher.Flush() // Flush headers to the client immediately
+	}
 }
 
 // Config struct to store configuration variables
@@ -232,7 +237,7 @@ type Config struct {
 // LoadConfig from environment variables
 func LoadConfig() *Config {
 	backendURL := getEnv("BACKEND_URL", "https://bridge.tonapi.io/bridge/events")
-	requestTimeout := getEnvAsInt("REQUEST_TIMEOUT", 30) // Default timeout of 30 seconds
+	requestTimeout := getEnvAsInt("REQUEST_TIMEOUT", 20) // Default timeout of 20 seconds
 	certFile := getEnv("TLS_CERT_FILE", "cert.pem")
 	keyFile := getEnv("TLS_KEY_FILE", "key.pem")
 
