@@ -146,28 +146,38 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 		log.Error().Err(err).Msg("Error encountered by reverse proxy")
 		if err == context.DeadlineExceeded {
 			w.WriteHeader(http.StatusGatewayTimeout)
+			w.Write([]byte("event: error\ndata: Connection timeout\n\n"))
+		} else if err == context.Canceled {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("event: close\ndata: Connection closed by client\n\n"))
 		} else {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		}
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), cfg.RequestTimeout)
-		defer cancel()
-
 		// Set proper SSE headers
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
+		// w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no") // Disable buffering in some proxies
 
+		// Flush headers explicitly for HTTP/2
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 			return
 		}
 
-		// Use custom context-aware response writer to handle streaming and context cancellation
+		// Flush headers immediately (important for HTTP/2)
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		// Create a cancellable context with a timeout
+		ctx, cancel := context.WithTimeout(r.Context(), cfg.RequestTimeout)
+		defer cancel()
+
+		// Use custom context-aware response writer
 		cw := &contextAwareResponseWriter{w: w, ctx: ctx, flusher: flusher}
 		proxy.ServeHTTP(cw, r)
 
@@ -181,8 +191,8 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 				w.Write([]byte("event: close\ndata: Connection closed after timeout\n\n"))
 				flusher.Flush()
 
-				// Close the connection gracefully
-				time.Sleep(100 * time.Millisecond) // Small delay to ensure client gets the final flush
+				// Small delay to ensure the client receives the final flush
+				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	})
