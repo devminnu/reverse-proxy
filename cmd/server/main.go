@@ -114,6 +114,17 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 		return nil
 	}
 
+	// Handle any errors during the proxying
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		if err == context.DeadlineExceeded {
+			log.Println("Context deadline exceeded, closing backend response")
+			// Gracefully close the connection without logging as an error
+			w.WriteHeader(http.StatusGatewayTimeout)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Set the context with a 20-second timeout
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
@@ -140,15 +151,17 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 			// When the context times out, ensure the connection is closed gracefully
 			if ctx.Err() == context.DeadlineExceeded {
 				log.Println("Timeout reached, closing connection with backend and sending 200 OK to client")
-				// Final flush to ensure all data is sent to the client
-				flusher.Flush()
 
-				// Close the connection with a proper 200 OK
+				// Send the headers and flush before closing
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
-				w.Write([]byte("Connection closed successfully after 20 seconds\n"))
-				flusher.Flush() // Final flush to ensure the client gets the final message
 
+				// Send a final message to indicate closure
+				w.Write([]byte("Connection closed successfully after 20 seconds\n"))
+				flusher.Flush() // Ensure the client receives all data
+
+				// Wait briefly to allow the browser to acknowledge the close
+				time.Sleep(100 * time.Millisecond)
 				return
 			}
 		}
