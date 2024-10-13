@@ -16,34 +16,35 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/quic-go/quic-go/http3"
-	"golang.org/x/net/http2"
 )
 
 func main() {
 	cfg := LoadConfig()
-	httpMux := http.NewServeMux()
 
-	// Handle /bridge/tonkeeper proxying with SSE stream forwarding
-	httpMux.Handle("/bridge/tonkeeper", ProxyHandlerWithTimeout(cfg))
+	// Initialize Gin router
+	router := gin.Default()
 
-	// Create HTTP/2 server
+	// Route to handle the /bridge/tonkeeper request with timeout handling
+	router.Any("/bridge/tonkeeper", func(c *gin.Context) {
+		ProxyHandlerWithTimeout(c, cfg)
+	})
+
+	// HTTP/2 server
 	http2Server := &http.Server{
 		Addr:    ":9443",
-		Handler: httpMux,
+		Handler: router,
 		TLSConfig: &tls.Config{
-			NextProtos:         []string{"h2", "http/1.1"}, // Support HTTP/2 and HTTP/1.1
-			InsecureSkipVerify: true,                       // Bypass TLS verification for local testing
+			NextProtos:         []string{"h2", "http/1.1"},
+			InsecureSkipVerify: true,
 		},
 	}
 
-	// Enable HTTP/2 on the server
-	http2.ConfigureServer(http2Server, &http2.Server{})
-
-	// Create HTTP/3 server
+	// HTTP/3 server
 	http3Server := &http3.Server{
 		TLSConfig: loadTLSConfig(cfg.CertFile, cfg.KeyFile),
-		Handler:   httpMux,
+		Handler:   router,
 	}
 
 	// Start UDP listener for HTTP/3
@@ -60,17 +61,15 @@ func main() {
 	// Start HTTP/2 server
 	go func() {
 		fmt.Println("Starting HTTP/2 server on :9443")
-		err := http2Server.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile)
-		if err != nil && err != http.ErrServerClosed {
+		if err := http2Server.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP/2 server failed: %v\n", err)
 		}
 	}()
 
-	// Start HTTP/3 server in a separate goroutine
+	// Start HTTP/3 server
 	go func() {
 		fmt.Println("Starting HTTP/3 server on :443")
-		err = http3Server.Serve(udpListener)
-		if err != nil && err != http.ErrServerClosed {
+		if err := http3Server.Serve(udpListener); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP/3 server failed: %v", err)
 		}
 	}()
@@ -78,19 +77,18 @@ func main() {
 	// Block until shutdown signal
 	<-stop
 
-	// Shutdown process
+	// Shutdown both servers gracefully
 	log.Println("Shutting down servers...")
-
-	// Shutdown HTTP/2 server
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	go func() {
+		// Shutdown HTTP/2
 		if err := http2Server.Shutdown(shutdownCtx); err != nil {
 			log.Println("Error while shutting down HTTP/2 server:", err)
 		}
 
-		// Shutdown HTTP/3 server
+		// Shutdown HTTP/3
 		if err := udpListener.Close(); err != nil {
 			log.Println("Error while shutting down UDP listener:", err)
 		}
@@ -106,12 +104,11 @@ func main() {
 	log.Println("Servers gracefully stopped")
 }
 
-// ProxyHandlerWithTimeout proxies the incoming request to the backend and stops after a timeout
-func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
+func ProxyHandlerWithTimeout(c *gin.Context, cfg *Config) {
 	targetURL, err := url.Parse(cfg.BackendURL)
 	if err != nil {
-		log.Println("Invalid/unsupported backend URL")
-		panic(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid backend URL"})
+		return
 	}
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 
@@ -145,50 +142,74 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 		req.Header.Del("Referer")
 	}
 
-	// Error handling
+	// Custom error handler to suppress panic and handle timeout gracefully
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		// Log the error but don't try to modify the response after headers are sent
 		if err == context.DeadlineExceeded {
 			log.Println("Context deadline exceeded, closing backend response")
-			w.WriteHeader(http.StatusGatewayTimeout)
+			// Only send headers if they haven't been sent
+			if !headersWereWritten(w) {
+				http.Error(w, "Request timed out", http.StatusGatewayTimeout)
+			}
+		} else if err == http.ErrAbortHandler {
+			// Handle abort panic gracefully, don't modify response
+			log.Println("Request aborted")
 		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("Proxy error: %v", err)
+			// Only send headers if they haven't been sent
+			if !headersWereWritten(w) {
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+			}
 		}
 	}
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Use a context with timeout
-		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-		defer cancel()
+	// Create a context with a 20-second timeout
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
 
-		// Handle flushing the data stream to the client
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-			return
-		}
+	// Handle flushing the data stream to the client
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Streaming not supported"})
+		return
+	}
 
-		cw := &contextAwareResponseWriter{w: w, ctx: ctx, flusher: flusher}
+	// Use a channel to monitor if headers were already written
+	headersWritten := false
 
-		// Handle real-time proxying
-		proxy.ServeHTTP(cw, r)
+	// Proxy the request and manage timeout
+	proxy.ServeHTTP(c.Writer, c.Request.WithContext(ctx))
 
-		// Block until context is done
-		select {
-		case <-ctx.Done():
-			if ctx.Err() == context.DeadlineExceeded {
-				log.Println("Timeout reached, closing backend and client connections")
+	// Flush headers and check if they were written
+	flusher.Flush()
+	headersWritten = true
 
-				// Ensure final response is sent to the client
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.WriteHeader(http.StatusOK)
-				w.Write([]byte("Connection closed after timeout\n"))
+	// Handle context timeout or normal completion
+	select {
+	case <-ctx.Done():
+		if ctx.Err() == context.DeadlineExceeded {
+			log.Println("Timeout reached, closing backend and client connections")
+
+			// Ensure no duplicate header write
+			if !headersWritten {
+				c.Writer.Header().Set("Content-Type", "text/event-stream")
+				c.Writer.WriteHeader(http.StatusOK)
+				_, _ = c.Writer.Write([]byte("Connection closed after timeout\n"))
 				flusher.Flush()
-
-				// Ensure graceful client closure
-				time.Sleep(100 * time.Millisecond)
 			}
+
+			// Graceful client closure
+			time.Sleep(100 * time.Millisecond)
 		}
-	})
+	}
+}
+
+// Helper function to check if headers were already written
+func headersWereWritten(w http.ResponseWriter) bool {
+	if rw, ok := w.(gin.ResponseWriter); ok {
+		return rw.Written()
+	}
+	return false
 }
 
 // Custom RoundTripper that handles backend connections
@@ -229,38 +250,6 @@ func (c *contextAwareReadCloser) Read(p []byte) (n int, err error) {
 		return 0, c.ctx.Err() // Stop reading when context is done
 	default:
 		return c.ReadCloser.Read(p)
-	}
-}
-
-// Custom response writer with context awareness
-type contextAwareResponseWriter struct {
-	w       http.ResponseWriter
-	ctx     context.Context
-	flusher http.Flusher
-}
-
-func (c *contextAwareResponseWriter) Header() http.Header {
-	return c.w.Header()
-}
-
-func (c *contextAwareResponseWriter) Write(data []byte) (int, error) {
-	select {
-	case <-c.ctx.Done():
-		return 0, c.ctx.Err()
-	default:
-		n, err := c.w.Write(data)
-		c.flusher.Flush() // Ensure data is sent to the client immediately
-		return n, err
-	}
-}
-
-func (c *contextAwareResponseWriter) WriteHeader(statusCode int) {
-	select {
-	case <-c.ctx.Done():
-		// Skip if context has been canceled
-	default:
-		c.w.WriteHeader(statusCode)
-		c.flusher.Flush() // Flush headers to the client immediately
 	}
 }
 
