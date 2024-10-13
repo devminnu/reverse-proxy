@@ -32,45 +32,40 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to load TLS certificates")
 	}
 	httpMux := http.NewServeMux()
-	// Handle /bridge/tonkeeper proxying with SSE stream forwarding
 	httpMux.Handle("/bridge/tonkeeper", ProxyHandlerWithTimeout(cfg))
-	// Create HTTP/2 server
+
 	http2Server := &http.Server{
 		Addr:    ":9443",
 		Handler: httpMux,
 		TLSConfig: &tls.Config{
 			Certificates:       []tls.Certificate{cert},
-			NextProtos:         []string{"h2", "http/1.1"}, // Support HTTP/2 and HTTP/1.1
-			InsecureSkipVerify: true,                       // Bypass TLS verification for local testing
+			NextProtos:         []string{"h2", "http/1.1"},
+			InsecureSkipVerify: true,
 		},
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 	}
-	// Enable HTTP/2 on the server
 	http2.ConfigureServer(http2Server, &http2.Server{})
 
-	// Create HTTP/3 server
 	http3Server := &http3.Server{
 		TLSConfig: &tls.Config{
-			MinVersion:         tls.VersionTLS13, // HTTP/3 requires at least TLS 1.3
+			MinVersion:         tls.VersionTLS13,
 			Certificates:       []tls.Certificate{cert},
-			NextProtos:         []string{"h3"}, // Support HTTP/3 only
-			InsecureSkipVerify: true,           // Allow self-signed certs for local testing
+			NextProtos:         []string{"h3"},
+			InsecureSkipVerify: true,
 		},
 		Handler: httpMux,
 	}
-	// Start UDP listener for HTTP/3
+
 	udpListener, err := net.ListenPacket("udp", ":443")
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to start UDP listener for HTTP/3")
 	}
 
-	// Signal handling for graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	done := make(chan bool, 1)
 
-	// Start HTTP/2 server
 	go func() {
 		fmt.Println("Starting HTTP/2 server on :9443")
 		err := http2Server.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile)
@@ -79,7 +74,6 @@ func main() {
 		}
 	}()
 
-	// Start HTTP/3 server in a separate goroutine
 	go func() {
 		fmt.Println("Starting HTTP/3 server on :443")
 		err = http3Server.Serve(udpListener)
@@ -88,20 +82,16 @@ func main() {
 		}
 	}()
 
-	// Block until shutdown signal
 	<-stop
 
-	// Shutdown process
 	log.Info().Msg("Shutting down servers...")
-	// Shutdown HTTP/2 server
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	go func() {
 		if err := http2Server.Shutdown(shutdownCtx); err != nil {
 			log.Error().Err(err).Msg("Error while shutting down HTTP/2 server")
 		}
-		// Shutdown HTTP/3 server
 		if err := udpListener.Close(); err != nil {
 			log.Error().Err(err).Msg("Error while shutting down UDP listener")
 		}
@@ -116,7 +106,6 @@ func main() {
 	log.Info().Msg("Servers gracefully stopped")
 }
 
-// ProxyHandlerWithTimeout proxies the incoming request to the backend and stops after a timeout
 func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 	targetURL, err := url.Parse(cfg.BackendURL)
 	if err != nil {
@@ -124,7 +113,6 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	// Custom RoundTripper to manage SSE and timeouts
 	proxy.Transport = &customRoundTripper{
 		rt: &http.Transport{
 			DialContext: (&net.Dialer{
@@ -137,7 +125,7 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 			ExpectContinueTimeout: 1 * time.Second,
 		},
 	}
-	// Modify the request before forwarding to the backend
+
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = targetURL.Scheme
 		req.URL.Host = targetURL.Host
@@ -153,57 +141,54 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 		req.Header.Del("Origin")
 		req.Header.Del("Referer")
 	}
-	// Error handling
+
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Info().Msg("proxy error handler")
+		log.Error().Err(err).Msg("Error encountered by reverse proxy")
 		if err == context.DeadlineExceeded {
-			log.Info().Msg("proxy error handler context deadline exceeded")
-			log.Error().Err(err).Msg("Context deadline exceeded, closing backend response")
 			w.WriteHeader(http.StatusGatewayTimeout)
 		} else {
-			log.Info().Msg("proxy internal server error")
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		}
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Use a context with timeout
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), cfg.RequestTimeout)
 		defer cancel()
 
-		// Handle flushing the data stream to the client
+		// Set proper SSE headers
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no") // Disable buffering in some proxies
+
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			log.Info().Msg("streaming not supported")
 			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-
 			return
 		}
 
+		// Use custom context-aware response writer to handle streaming and context cancellation
 		cw := &contextAwareResponseWriter{w: w, ctx: ctx, flusher: flusher}
-		// Handle real-time proxying
 		proxy.ServeHTTP(cw, r)
 
-		// Block until context is done
+		// Handle context timeout for closing connections gracefully
 		select {
 		case <-ctx.Done():
 			if ctx.Err() == context.DeadlineExceeded {
-				log.Error().Err(ctx.Err()).Msg("Timeout reached, closing backend and client connections")
+				log.Info().Msg("Timeout reached, closing backend and client connections")
 
-				// Ensure final response is sent to the client
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.WriteHeader(http.StatusOK)
-				w.Write([]byte("Connection closed after timeout\n"))
+				// Send a final SSE event to notify the client of closure
+				w.Write([]byte("event: close\ndata: Connection closed after timeout\n\n"))
 				flusher.Flush()
 
-				// Ensure graceful client closure
-				// time.Sleep(100 * time.Millisecond)
+				// Close the connection gracefully
+				time.Sleep(100 * time.Millisecond) // Small delay to ensure client gets the final flush
 			}
 		}
 	})
+
 }
 
-// Custom RoundTripper that handles backend connections
 type customRoundTripper struct {
 	rt http.RoundTripper
 }
@@ -213,17 +198,13 @@ func (c *customRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 
 	resp, err := c.rt.RoundTrip(req)
 	if err != nil {
-		log.Error().Err(err).Msg("round trip error")
-
 		return nil, err
 	}
 
-	// Monitor context and close connection if timeout occurs
 	go func() {
 		select {
 		case <-ctx.Done():
-			log.Info().Msg("Context canceled, closing backend connection")
-			resp.Body.Close() // Close connection gracefully
+			resp.Body.Close()
 		}
 	}()
 
@@ -232,33 +213,20 @@ func (c *customRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	return resp, nil
 }
 
-// Custom context-aware ReadCloser
 type contextAwareReadCloser struct {
 	ctx context.Context
 	io.ReadCloser
 }
 
 func (c *contextAwareReadCloser) Read(p []byte) (n int, err error) {
-	log.Info().Msg("read..")
 	select {
 	case <-c.ctx.Done():
-		log.Error().Err(c.ctx.Err()).Msg("context done,stop reading")
-		return 0, c.ctx.Err() // Stop reading when context is done
+		return 0, c.ctx.Err()
 	default:
-		log.Info().Msg("read")
-		n, err := c.ReadCloser.Read(p)
-		if err != nil {
-			if err == context.Canceled {
-				log.Error().Err(err).Msg("context cancelled")
-				return 0, nil
-			}
-			return 0, err
-		}
-		return n, nil
+		return c.ReadCloser.Read(p)
 	}
 }
 
-// Custom response writer with context awareness
 type contextAwareResponseWriter struct {
 	w       http.ResponseWriter
 	ctx     context.Context
@@ -276,25 +244,22 @@ func (c *contextAwareResponseWriter) Write(data []byte) (int, error) {
 	default:
 		n, err := c.w.Write(data)
 		if err != nil {
-			log.Error().Err(err).Msg("write error")
 			return 0, err
 		}
-		c.flusher.Flush() // Ensure data is sent to the client immediately
-		return n, err
+		c.flusher.Flush()
+		return n, nil
 	}
 }
 
 func (c *contextAwareResponseWriter) WriteHeader(statusCode int) {
 	select {
 	case <-c.ctx.Done():
-		// Skip if context has been canceled
 	default:
 		c.w.WriteHeader(statusCode)
-		c.flusher.Flush() // Flush headers to the client immediately
+		c.flusher.Flush()
 	}
 }
 
-// Config struct for storing configuration variables
 type Config struct {
 	BackendURL     string
 	RequestTimeout time.Duration
@@ -302,10 +267,9 @@ type Config struct {
 	KeyFile        string
 }
 
-// LoadConfig from environment variables
 func LoadConfig() *Config {
 	backendURL := getEnv("BACKEND_URL", "https://bridge.tonapi.io/bridge/events")
-	requestTimeout := getEnvAsInt("REQUEST_TIMEOUT", 10) // Default timeout of 10 seconds
+	requestTimeout := getEnvAsInt("REQUEST_TIMEOUT", 10)
 	certFile := getEnv("TLS_CERT_FILE", "cert.pem")
 	keyFile := getEnv("TLS_KEY_FILE", "key.pem")
 
@@ -317,7 +281,6 @@ func LoadConfig() *Config {
 	}
 }
 
-// Helper function to get environment variables
 func getEnv(key, defaultValue string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
