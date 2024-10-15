@@ -4,14 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -20,6 +18,8 @@ import (
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/http2"
 )
+
+const StatusClientClosedRequest = 499 // Define the custom status code for "Client Closed Request"
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
@@ -111,20 +111,21 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 		log.Fatal().Err(err).Msg("Invalid backend URL")
 	}
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Transport = &customRoundTripper{
-		rt: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 10 * time.Second,
-			}).DialContext,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   3 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-	}
+	// proxy.Transport = &customRoundTripper{
+	// 	rt: &http.Transport{
+	// 		DialContext: (&net.Dialer{
+	// 			Timeout:   10 * time.Second,
+	// 			KeepAlive: 10 * time.Second,
+	// 		}).DialContext,
+	// 		MaxIdleConns:          100,
+	// 		IdleConnTimeout:       90 * time.Second,
+	// 		TLSHandshakeTimeout:   3 * time.Second,
+	// 		ExpectContinueTimeout: 1 * time.Second,
+	// 	},
+	// }
 
 	proxy.Director = func(req *http.Request) {
+		log.Debug().Msgf("Proxying request: %v %v", req.Method, req.URL.String())
 		req.URL.Scheme = targetURL.Scheme
 		req.URL.Host = targetURL.Host
 		req.URL.Path = targetURL.Path
@@ -138,101 +139,111 @@ func ProxyHandlerWithTimeout(cfg *Config) http.Handler {
 
 		req.Header.Del("Origin")
 		req.Header.Del("Referer")
+		log.Debug().Msgf("Updated request URL: %v", req.URL.String())
 	}
 
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Error().Err(err).Msg("Error encountered by reverse proxy")
-		if err == context.DeadlineExceeded {
-			w.WriteHeader(http.StatusGatewayTimeout)
-			w.Write([]byte("event: error\ndata: Connection timeout\n\n"))
-		} else if err == context.Canceled {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("event: close\ndata: Connection closed by client\n\n"))
-		} else {
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		}
-	}
+	// proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+	// 	log.Error().Err(err).Msg("Error encountered by reverse proxy")
+	// 	if err == context.DeadlineExceeded {
+	// 		log.Error().Msg("Request timed out")
+	// 		// Do not send any error message to the client; simply close the connection gracefully
+	// 	} else if err == context.Canceled {
+	// 		log.Warn().Msg("Client canceled the request")
+	// 		// Do not send any error message, simply close connection
+	// 	} else if isClosedConnError(err) {
+	// 		log.Warn().Msg("Client connection closed unexpectedly")
+	// 		return
+	// 	} else {
+	// 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	// 	}
+	// }
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Set proper SSE headers
+		log.Debug().Msgf("Handling request: %v %v", r.Method, r.URL.Path)
+
+		// Set proper SSE headers and flush immediately
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no") // Disable buffering in some proxies
 
-		// Flush headers explicitly for HTTP/2
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 			return
 		}
 
-		// Flush headers immediately (important for HTTP/2)
-		w.WriteHeader(http.StatusOK)
+		// Send the initial 200 OK status and flush headers
 		flusher.Flush()
 
-		// Create a cancellable context with a timeout
 		ctx, cancel := context.WithTimeout(r.Context(), cfg.RequestTimeout)
 		defer cancel()
 
-		// Use custom context-aware response writer
 		cw := &contextAwareResponseWriter{w: w, ctx: ctx, flusher: flusher}
-		proxy.ServeHTTP(cw, r)
+		log.Debug().Msg("Starting proxy for client")
 
-		// Handle context timeout for closing connections gracefully
+		// Continuously proxy and stream data from the backend
+		proxy.ServeHTTP(cw, r)
+		w.WriteHeader(http.StatusOK)
+
+		log.Info().Msg("Proxy finished, checking for context completion")
 		select {
 		case <-ctx.Done():
+			// If the context is canceled (e.g., timeout), just silently close the connection
 			if ctx.Err() == context.DeadlineExceeded {
 				log.Info().Msg("Timeout reached, closing backend and client connections")
-
-				// Send a final SSE event to notify the client of closure
-				w.Write([]byte("event: close\ndata: Connection closed after timeout\n\n"))
-				flusher.Flush()
-
-				// Small delay to ensure the client receives the final flush
-				time.Sleep(100 * time.Millisecond)
+				// No event or error is sent, just close the connection gracefully
+				return
 			}
 		}
 	})
 
 }
 
-type customRoundTripper struct {
-	rt http.RoundTripper
-}
+// type customRoundTripper struct {
+// 	rt http.RoundTripper
+// }
 
-func (c *customRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	ctx := req.Context()
+// func (c *customRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+// 	log.Debug().Msgf("RoundTrip: %v %v", req.Method, req.URL.String())
 
-	resp, err := c.rt.RoundTrip(req)
-	if err != nil {
-		return nil, err
-	}
+// 	ctx := req.Context()
 
-	go func() {
-		select {
-		case <-ctx.Done():
-			resp.Body.Close()
-		}
-	}()
+// 	resp, err := c.rt.RoundTrip(req)
+// 	if err != nil {
+// 		log.Error().Err(err).Msg("Error in RoundTrip")
+// 		return nil, err
+// 	}
 
-	resp.Body = &contextAwareReadCloser{ctx: ctx, ReadCloser: resp.Body}
+// 	log.Debug().Msg("Starting goroutine to watch for context cancellation")
+// 	go func() {
+// 		select {
+// 		case <-ctx.Done():
+// 			if resp.Body != nil {
+// 				log.Warn().Msg("Context done, closing response body")
+// 				resp.Body.Close()
+// 			}
+// 		}
+// 	}()
 
-	return resp, nil
-}
+// 	resp.Body = &contextAwareReadCloser{ctx: ctx, ReadCloser: resp.Body}
+// 	return resp, nil
+// }
 
-type contextAwareReadCloser struct {
-	ctx context.Context
-	io.ReadCloser
-}
+// type contextAwareReadCloser struct {
+// 	ctx context.Context
+// 	io.ReadCloser
+// }
 
-func (c *contextAwareReadCloser) Read(p []byte) (n int, err error) {
-	select {
-	case <-c.ctx.Done():
-		return 0, c.ctx.Err()
-	default:
-		return c.ReadCloser.Read(p)
-	}
-}
+// func (c *contextAwareReadCloser) Read(p []byte) (n int, err error) {
+// 	select {
+// 	case <-c.ctx.Done():
+// 		log.Warn().Msg("Context done, aborting read")
+// 		c.ReadCloser.Close()
+// 		return 0, c.ctx.Err()
+// 	default:
+// 		return c.ReadCloser.Read(p)
+// 	}
+// }
 
 type contextAwareResponseWriter struct {
 	w       http.ResponseWriter
@@ -247,10 +258,12 @@ func (c *contextAwareResponseWriter) Header() http.Header {
 func (c *contextAwareResponseWriter) Write(data []byte) (int, error) {
 	select {
 	case <-c.ctx.Done():
+		log.Warn().Msg("Context done, aborting write")
 		return 0, c.ctx.Err()
 	default:
 		n, err := c.w.Write(data)
 		if err != nil {
+			log.Error().Err(err).Msg("Error while writing response")
 			return 0, err
 		}
 		c.flusher.Flush()
@@ -261,45 +274,9 @@ func (c *contextAwareResponseWriter) Write(data []byte) (int, error) {
 func (c *contextAwareResponseWriter) WriteHeader(statusCode int) {
 	select {
 	case <-c.ctx.Done():
+		log.Warn().Msg("Context done, skipping write header")
 	default:
 		c.w.WriteHeader(statusCode)
 		c.flusher.Flush()
 	}
-}
-
-type Config struct {
-	BackendURL     string
-	RequestTimeout time.Duration
-	CertFile       string
-	KeyFile        string
-}
-
-func LoadConfig() *Config {
-	backendURL := getEnv("BACKEND_URL", "https://bridge.tonapi.io/bridge/events")
-	requestTimeout := getEnvAsInt("REQUEST_TIMEOUT", 10)
-	certFile := getEnv("TLS_CERT_FILE", "cert.pem")
-	keyFile := getEnv("TLS_KEY_FILE", "key.pem")
-
-	return &Config{
-		BackendURL:     backendURL,
-		RequestTimeout: time.Duration(requestTimeout) * time.Second,
-		CertFile:       certFile,
-		KeyFile:        keyFile,
-	}
-}
-
-func getEnv(key, defaultValue string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	return defaultValue
-}
-
-func getEnvAsInt(name string, defaultValue int) int {
-	if valueStr, exists := os.LookupEnv(name); exists {
-		if value, err := strconv.Atoi(valueStr); err == nil {
-			return value
-		}
-	}
-	return defaultValue
 }
