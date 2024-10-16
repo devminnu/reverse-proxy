@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"reverse-proxy/config"
-	"time"
 
 	"github.com/rs/zerolog/log"
 )
@@ -13,7 +12,7 @@ import (
 func ProxyHandlerWithTimeout(cfg *config.Config) http.Handler {
 	client := &http.Client{}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), cfg.RequestTimeout)
 		defer cancel()
 		req, err := http.NewRequestWithContext(ctx, r.Method, cfg.BackendURL.URL.String(), r.Body)
 		if err != nil {

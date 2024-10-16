@@ -20,7 +20,6 @@ import (
 
 func main() {
 	cfg := config.GetConfig()
-	log.Debug().Int("dd", int(15*time.Second)).Msg("")
 	log.Debug().Interface("config", cfg).Msg("app config")
 	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 	if err != nil {
