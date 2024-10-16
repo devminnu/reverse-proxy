@@ -35,7 +35,7 @@ The reverse proxy uses environment variables for configuration. You can set the 
 1. **Set up environment variables**:
     ```bash
     export BACKEND_URL="https://your-backend.com/endpoint"
-    export REQUEST_TIMEOUT=60
+    export REQUEST_TIMEOUT=60s
     export TLS_CERT_FILE="path/to/cert.pem"
     export TLS_KEY_FILE="path/to/key.pem"
     ```
