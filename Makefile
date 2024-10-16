@@ -7,7 +7,7 @@ CERT_FILE=$(CERT_DIR)/cert.pem
 KEY_FILE=$(CERT_DIR)/key.pem
 DOMAIN=localhost
 BACKEND_URL=https://bridge.tonapi.io/bridge/events
-REQUEST_TIMEOUT=60
+REQUEST_TIMEOUT=60s
 
 # Go commands
 GO=go
