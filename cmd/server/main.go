@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -16,6 +17,8 @@ import (
 	"golang.org/x/net/http2/h2c"
 )
 
+// ProxyHandlerWithTimeout sets up a reverse proxy that streams the response in real-time
+// and gracefully handles the connection after a timeout.
 func ProxyHandlerWithTimeout(backendURL string) http.Handler {
 	targetURL, err := url.Parse(backendURL)
 	if err != nil {
@@ -71,8 +74,9 @@ func ProxyHandlerWithTimeout(backendURL string) http.Handler {
 				if err != nil {
 					log.Error().Err(err).Msg("Error sending success message")
 				}
+
 				flusher.Flush() // Ensure the final message is sent
-				log.Debug().Msg("seinf finalllll")
+
 				// Properly end the chunked transfer by sending the terminating chunk
 				_, err = w.Write([]byte("0\r\n\r\n"))
 				if err != nil {
@@ -83,7 +87,41 @@ func ProxyHandlerWithTimeout(backendURL string) http.Handler {
 			close(done) // Signal the stream is closed
 		}()
 
-		// Proxy the request to the backend and stream the response to the client
+		// ModifyResponse to stream the response in real-time
+		proxy.ModifyResponse = func(response *http.Response) error {
+			flusher.Flush() // Start streaming right away
+
+			// Stream the response from the backend to the client in chunks
+			buf := make([]byte, 4096) // Adjust the buffer size as needed
+			for {
+				select {
+				case <-ctx.Done():
+					// Context was canceled (timeout or client disconnected), stop reading from backend
+					return ctx.Err()
+				default:
+					// Stream the data from backend to the client
+					n, err := response.Body.Read(buf)
+					if n > 0 {
+						_, writeErr := w.Write(buf[:n])
+						if writeErr != nil {
+							log.Error().Err(writeErr).Msg("Error writing response to client")
+							return writeErr
+						}
+						flusher.Flush() // Flush each chunk immediately to the client
+					}
+					if err != nil {
+						if err == io.EOF {
+							break // Properly handle EOF
+						}
+						log.Error().Err(err).Msg("Error reading from backend response")
+						return err
+					}
+				}
+			}
+			return nil
+		}
+
+		// Proxy the request to the backend
 		proxy.ServeHTTP(w, r)
 
 		// Wait for the done signal before exiting to ensure no abrupt closure
